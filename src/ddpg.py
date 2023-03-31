@@ -4,6 +4,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 import os
+import gym
 
 
 # thanks to Machine Learning with Phil on YouTube for the video guide
@@ -35,27 +36,42 @@ class OUActionNoise:
 # Buffer to store <state, action, reward, next_state, terminal> tuples from episodes
 # will sample from this to train the networks with mini-batches
 class ReplayBuffer:
-    def __init__(self, max_size, input_shape, n_actions) -> None:
+    def __init__(self, max_size, input_shape) -> None:
         self.mem_size = max_size
         self.mem_cntr = 0
         # store pieces of the memory in different np arrays
         # * operator unpacks tuples in python, FYI
-        self.state_memory = np.zeros((self.mem_size, *input_shape))
-        self.next_state_memory = np.zeros((self.mem_size, *input_shape))
-        self.action_memory = np.zeros((self.mem_size, n_actions))
+        self.agent_obs_memory = np.zeros((self.mem_size, *input_shape))
+        self.next_agent_obs_memory = np.zeros((self.mem_size, *input_shape))
+        self.action_memory = np.zeros((self.mem_size), dtype=object)
         self.reward_memory = np.zeros(self.mem_size)
         self.terminal_memory = np.zeros(self.mem_size, dtype=np.float32)
+        self.vpt_state_memory = np.zeros(self.mem_size, dtype=object)
+
+    def __getitem__(self, key):
+        agent_obs = self.agent_obs_memory[key]
+        next_agent_obs = self.next_agent_obs_memory[key]
+        reward = self.reward_memory[key]
+        action = self.action_memory[key]
+        terminal = self.terminal_memory[key] 
+        vpt_state = self.vpt_state_memory[key]
+
+        return agent_obs, action, reward, next_agent_obs, terminal, vpt_state
+    
+    def __len__(self):
+        return self.mem_cntr
 
     # state in this case is basically the obs
-    def store_transition(self, state, action, reward, next_state, done):
+    def store_transition(self, agent_obs, action, reward, next_agent_obs, done, vpt_state):
         # wrapping index to override oldest memory when you reach limit
         index = self.mem_cntr % self.mem_size
 
-        self.state_memory[index] = state
+        self.agent_obs_memory[index] = agent_obs
         self.action_memory[index] = action
         self.reward_memory[index] = reward
-        self.next_state_memory[index] = next_state
+        self.next_agent_obs_memory[index] = next_agent_obs
         self.terminal_memory[index] = 1-done
+        self.vpt_state_memory[index] = vpt_state
 
         self.mem_cntr += 1
 
@@ -66,8 +82,8 @@ class ReplayBuffer:
         batch = np.random.choice(max_mem, batch_size)
 
         # grab random samples from the buffer
-        states = self.state_memory[batch]
-        next_states = self.next_state_memory[batch]
+        states = self.agent_obs_memory[batch]
+        next_states = self.next_agent_obs_memory[batch]
         rewards = self.reward_memory[batch]
         actions = self.action_memory[batch]
         terminals = self.terminal_memory[batch]
@@ -216,7 +232,7 @@ class ExampleActorNetwork(nn.Module):
         self.load_state_dict(T.load(self.checkpoint_file))
 
 
-class Agent():
+class ExampleAgent():
     # tau is a hyperparameter for updating the target network
     # gamma is the discount factor
     def __init__(self, actor_lr, critic_lr, input_dims, tau, env, gamma=0.99, 
@@ -228,6 +244,8 @@ class Agent():
         self.memory = ReplayBuffer(max_size, input_dims, n_actions)
         self.batch_size = batch_size
 
+
+        ## change this out with the MineRL heads
         self.actor = ExampleActorNetwork(actor_lr, input_dims, layer1_size, layer2_size,
                                           n_actions=n_actions, name="actor")
         
@@ -367,3 +385,18 @@ class Agent():
 
 
 
+# This wrapper class is to normalize the values of the action space
+# Pulled from this https://github.com/ghliu/pytorch-ddpg/blob/master/normalized_env.py implementation
+# of DDPG on github
+class NormalizedEnv(gym.ActionWrapper):
+    """ Wrap action """
+
+    def action(self, action):
+        act_k = (self.action_space.high - self.action_space.low)/ 2.
+        act_b = (self.action_space.high + self.action_space.low)/ 2.
+        return act_k * action + act_b
+
+    def reverse_action(self, action):
+        act_k_inv = 2./(self.action_space.high - self.action_space.low)
+        act_b = (self.action_space.high + self.action_space.low)/ 2.
+        return act_k_inv * (action - act_b)
