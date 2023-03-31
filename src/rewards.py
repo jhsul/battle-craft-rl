@@ -49,6 +49,10 @@ class RewardsCalculator:
 
         return reward
 
+    def clear(self):
+        for k in self.stats:
+            self.stats[k][1] = 0
+
 
 if __name__ == "__main__":
     # unit tests are cringe
