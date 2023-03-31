@@ -84,7 +84,7 @@ class DDPG_MineRLAgent():
         if load:
             self.load_models()
 
-    def choose_action(self, obs, first, state):
+    def choose_action(self, agent_obs, first, state):
 
         # This is a very cheap way of using DDPG, just using argmax to make this deterministic
         # Run the forward pass through the model, first the base then the heads
