@@ -36,13 +36,12 @@ class OUActionNoise:
 # Buffer to store <state, action, reward, next_state, terminal> tuples from episodes
 # will sample from this to train the networks with mini-batches
 class ReplayBuffer:
-    def __init__(self, max_size, input_shape) -> None:
+    def __init__(self, max_size) -> None:
         self.mem_size = max_size
         self.mem_cntr = 0
-        # store pieces of the memory in different np arrays
-        # * operator unpacks tuples in python, FYI
-        self.agent_obs_memory = np.zeros((self.mem_size, *input_shape))
-        self.next_agent_obs_memory = np.zeros((self.mem_size, *input_shape))
+
+        self.agent_obs_memory = np.zeros((self.mem_size), dtype=object)
+        self.next_agent_obs_memory = np.zeros((self.mem_size), dtype=object)
         self.action_memory = np.zeros((self.mem_size), dtype=object)
         self.reward_memory = np.zeros(self.mem_size)
         self.terminal_memory = np.zeros(self.mem_size, dtype=np.float32)
@@ -87,8 +86,9 @@ class ReplayBuffer:
         rewards = self.reward_memory[batch]
         actions = self.action_memory[batch]
         terminals = self.terminal_memory[batch]
+        vpt_states = self.vpt_state_memory[batch]
 
-        return states, actions, rewards, next_states, terminals
+        return states, actions, rewards, next_states, terminals, vpt_states
 
 
 # Example critic network for DDPG that has 2 fully connected hidden layers

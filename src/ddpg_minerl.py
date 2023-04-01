@@ -37,7 +37,7 @@ class ReplayBufferDataset(Dataset):
 class DDPG_MineRLAgent():
     # tau is a hyperparameter for updating the target network
     # gamma is the discount factor
-    def __init__(self, actor_lr, critic_lr, input_dims, tau, env ,gamma=0.99, max_size=10000,
+    def __init__(self, actor_lr, critic_lr, tau, env ,gamma=0.99, max_size=10000,
                  batch_size=64, load=False, betas: tuple = (0.9, 0.999),
                  model_path="./models/foundation-model-2x.model", 
                  weights_path="./weights/foundation-model-2x.weights"):
@@ -45,7 +45,7 @@ class DDPG_MineRLAgent():
         self.env = env
         self.gamma = gamma
         self.tau = tau
-        self.memory = ReplayBuffer(max_size, input_dims)
+        self.memory = ReplayBuffer(max_size)
         self.batch_size = batch_size
 
        # Load the agent parameters from the weight files
@@ -112,9 +112,9 @@ class DDPG_MineRLAgent():
     
     def remember(self, state, action, reward, next_state, done, vpt_state):
         # make the torchc tensors numpy arrays for storage
-        self.memory.store_transition(state['img'].detach().numpy(), 
+        self.memory.store_transition(state, 
                                      action, reward, 
-                                     next_state['img'].detach().numpy(), 
+                                     next_state, 
                                      done, vpt_state)
 
     def learn(self):
@@ -124,56 +124,78 @@ class DDPG_MineRLAgent():
             return
         
 
-        data = ReplayBufferDataset(self.memory)
-        dl = DataLoader(data, self.batch_size)
-
         # set networks to eval mode
         self.target_actor.eval()
         self.target_critic.eval()
         self.critic.eval()
 
-        for agent_obs, action, reward, next_agent_obs, done, vpt_state in dl:
+        agent_obs, action, reward, next_agent_obs, done, vpt_state = \
+            self.memory.sample_buffer(self.batch_size)
 
-            dummy_first = T.from_numpy(np.array((False,))).to(device)
-            first = dummy_first.unsqueeze(1)
-            # get the target critic value
+        dummy_first = T.from_numpy(np.array((False,))).to(device)
+        first = dummy_first.unsqueeze(1)
+
+        # calculate critic and target values from minibatch, unvectorized
+        target = []
+        critic_v_hs = []
+        for j in range(self.batch_size):
             (pi_h, v_h), state = self.agent.policy.net(
-                next_agent_obs, vpt_state, context={"first": first})
-
-            next_critic_value = self.target_critic.forward(v_h)
+                next_agent_obs[j], vpt_state[j], context={"first": first})
             
+            # I dont care about target critic gradients, so I can run this here
+            next_critic_value = self.target_critic.forward(v_h)
+            # calculate bellman equation using network values
+            target.append(reward[j] + self.gamma*next_critic_value*done[j])
+
             # get the regular critic value
             # TODO this critic value should probably just be in memory
-            # (or not because we are updating as we go?)
             (pi_h, v_h), state = self.agent.policy.net(
-                agent_obs, state, context={"first": first})
-            critic_value = self.critic.forward(v_h)
+                agent_obs[j], vpt_state[j], context={"first": first})
+            critic_v_hs.append(v_h.detach().numpy())
+        critic_v_hs = np.array(critic_v_hs)
 
-            # calculate bellman equation using network values
-            target = reward + self.gamma*next_critic_value*done
+        # Change the data format of the critic and target critic values
+        target = T.tensor(target).to(device)
+        target = target.view(self.batch_size, 1)
 
-            # now train the critic
-            self.critic.train()
-            self.critic_optim.zero_grad()
-            critic_loss = F.mse_loss(target, critic_value)
-            critic_loss.backward()
-            self.critic_optim.step()
+        critic_v_hs = T.tensor(critic_v_hs).to(device)
 
-            # train the actor
-            self.critic.eval()
-            self.actor.optimizer.zero_grad()
-            mu = self.actor.forward(agent_obs)
-            self.actor.train()
+        # store the vhs in a separete tensor and perform the operation this way to 
+        # maintain gradient calculations (as opposed to running .forward in the loop)
+        critic_value = self.critic.forward(critic_v_hs)
 
-            # the gradient of the actor is just the forward pass of the critic?
-            # some result from the paper... (I think that is what this says?)
-            actor_loss = -self.critic.forward(agent_obs, mu)
-            actor_loss = T.mean(actor_loss)
-            actor_loss.backward()
-            self.actor.optimizer.step()
+        # now train the critic
+        self.critic.train()
+        self.critic_optim.zero_grad()
+        critic_loss = F.mse_loss(target[:, None, None], critic_value)
+        critic_loss.backward()
+        self.critic_optim.step()
 
-            # update the target network gradually
-            self.update_network_parameters()
+        # train the actor
+        self.actor_optim.zero_grad()
+        self.actor.train()
+        # Recalculate critic values after the critic update
+        critic_value = []
+        with T.no_grad():
+            for j in range(self.batch_size):
+                (pi_h, v_h), state = self.agent.policy.net(
+                    agent_obs[j], vpt_state[j], context={"first": first})
+                critic_value.append(self.critic.forward(v_h))
+
+        critic_value = T.tensor(critic_value, requires_grad=True).to(device)
+        critic_value = critic_value.view(self.batch_size, 1)
+
+        # The LOSS function of the actor is the the (negative, for minimization) critic value
+        # The gradient of the actor values is auto-calculated in computng this, usually...
+        # TODO since the actors weights never go into computing this, there is no way to update them...
+        # NEED to update the entire network for this to work...
+        actor_loss = -critic_value
+        actor_loss = T.mean(actor_loss)
+        actor_loss.backward()
+        self.actor_optim.step()
+
+        # update the target network gradually
+        self.update_network_parameters()
 
     # this is for updating the target networks to lag behind the ones we are training
     # tau is small, near 0
@@ -232,9 +254,8 @@ def train():
     env = gym.make(env_name)
 
     # not sure how well DDPG works with a mostly discrete action space, guess we'll see!
-    ddpg = DDPG_MineRLAgent(actor_lr=0.000025, critic_lr=0.00025,
-                input_dims=[128,128,3], tau=0.001, env=env,
-                batch_size=64, load=False)
+    ddpg = DDPG_MineRLAgent(actor_lr=0.000025, critic_lr=0.00025, tau=0.001, env=env,
+                batch_size=16, load=False)
     
     rc = RewardsCalculator(
         damage_dealt=1
@@ -270,12 +291,18 @@ def train():
 
             # Choose the action deterministically
             act, new_state = ddpg.choose_action(agent_obs, first, state)
-            next_agent_obs, reward, done, info = env.step(act)
-        
+            next_obs, reward, done, info = env.step(act)
+
+
             # Use our custom reward calculator instead
-            reward = rc.get_rewards(next_agent_obs)
-            raw_obs = next_agent_obs
-            next_agent_obs = ddpg.agent._env_obs_to_agent(next_agent_obs)
+            reward = rc.get_rewards(next_obs)
+
+            # process the new observation
+            next_agent_obs = ddpg.agent._env_obs_to_agent(next_obs)
+
+            # For some reason the result from above is one dimension too
+            # short, and this fixes that problem
+            next_agent_obs['img'] = next_agent_obs['img'][None, :]
 
             ddpg.remember(agent_obs, act, reward, 
                           next_agent_obs, int(done), state)
@@ -284,7 +311,10 @@ def train():
             # (as opposed to Monte Carlo methods than learn after each episode)
             ddpg.learn()
             score += reward
+
+            # set variables for next iteration
             state = new_state
+            raw_obs = next_obs
             
             # Finally, render the environment to the screen
             # Comment this out if you are boring
