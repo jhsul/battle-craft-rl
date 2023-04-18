@@ -14,11 +14,11 @@ from lib.policy import MinecraftAgentPolicy
 from lib.scaled_mse_head import ScaledMSEHead
 
 from lib.torch_util import default_device_type, set_default_torch_device
-from vpt.agent import ACTION_TRANSFORMER_KWARGS, POLICY_KWARGS, PI_HEAD_KWARGS, AGENT_RESOLUTION, resize_image
+from agent import ACTION_TRANSFORMER_KWARGS, POLICY_KWARGS, PI_HEAD_KWARGS, AGENT_RESOLUTION, resize_image
 
 class ConnectionNetwork(nn.Module):
     def __init__(self, latent_size):
-        super().__init__()
+        super(ConnectionNetwork, self).__init__()
 
         self.connection_layer1 = nn.Linear(latent_size,
                                           latent_size)
@@ -33,7 +33,7 @@ class ConnectionNetwork(nn.Module):
 class EfficientVPT(nn.Module):
 
     def __init__(self, env, device=None, policy_kwargs=None, pi_head_kwargs=None):
-        
+        super(EfficientVPT, self).__init__()
         if device is None:
             device = 'cpu'
         self.device = th.device(device)
@@ -68,7 +68,7 @@ class EfficientVPT(nn.Module):
         
     def run_vpt_base(self, agent_obs, hidden_state, dummy_first):
         (latent, _), hidden_state_out = self.policy.net(
-            agent_obs, hidden_state, t={"first": dummy_first})
+            agent_obs, hidden_state, context={"first": dummy_first})
         
         return latent, hidden_state_out
 
@@ -85,10 +85,10 @@ class EfficientVPT(nn.Module):
         return self.policy.value_head(latent)
     
     def value_parameters(self):
-        return list[self.value_head.parameters()] + list[self.value_processor.parameters()]
+        return list(self.value_head.parameters()) + list(self.value_processor.parameters())
     
     def policy_parameters(self):
-        return list[self.policy.parameters()] + list[self.connection_net.parameters()]
+        return list(self.policy.parameters()) + list(self.connection_net.parameters())
     
     def initial_state(self, minibatch_size: int):
         return self.policy.initial_state(minibatch_size)

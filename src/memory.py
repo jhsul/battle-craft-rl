@@ -56,6 +56,25 @@ class MemoryDataset(Dataset):
         # This needs to be returned as a tuple
         return mem.agent_obs, mem.hidden_state, mem.pi_h, mem.v_h, mem.action, mem.action_log_prob, mem.reward, mem.total_reward, mem.done, mem.value
 
+class IndexedMemoryDataset(Dataset):
+    """
+    This is a dataset of memory objects (potentially multiple episodes!)
+    This is to be used with the PyTorch DataLoader
+    """
+
+    def __init__(self, memories: List[Memory]):
+        self.memories: List[Memory] = memories
+
+    def __len__(self):
+        return len(self.memories)
+
+    def __getitem__(self, idx):
+        mem = self.memories[idx]
+
+        # This needs to be returned as a tuple
+        return mem.agent_obs, mem.hidden_state, mem.pi_h, mem.v_h, mem.action, mem.action_log_prob, mem.reward, mem.total_reward, mem.done, mem.value, idx
+
+
 
 # This is probably not needed, but might as well define this type so we have it
 # Edit: this is almost certainly not useful since we shuffle memories anyway

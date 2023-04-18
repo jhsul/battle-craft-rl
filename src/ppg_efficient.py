@@ -14,7 +14,7 @@ import gc
 from efficient_vpt import EfficientVPT
 from datetime import datetime
 from tqdm import tqdm
-from memory import Memory, MemoryDataset, AuxMemory
+from memory import Memory, MemoryDataset, AuxMemory, IndexedMemoryDataset
 from util import to_torch_tensor, normalize, safe_reset, hard_reset, calculate_gae
 from vectorized_minerl import *
 
@@ -32,7 +32,7 @@ TRAIN_WHOLE_MODEL = False
 
 
 
-class PhasicPolicyGradient:
+class EfficientPhasicPolicyGradient:
     def __init__(
             self,
             env_name: str,
@@ -44,7 +44,6 @@ class PhasicPolicyGradient:
 
             # Hyperparameters
             num_rollouts: int,
-            num_steps: int,  # the number of steps per rollout, T
             epochs: int,
             minibatch_size: int,
             lr: float,
@@ -84,7 +83,6 @@ class PhasicPolicyGradient:
 
         # Load hyperparameters unchanged
         self.num_rollouts = num_rollouts
-        self.num_steps = num_steps
         self.epochs = epochs
         self.minibatch_size = minibatch_size
         self.lr = lr
@@ -149,8 +147,7 @@ class PhasicPolicyGradient:
         # Internal buffer of the most recent episode memories
         # This will be a relatively large chunk of data
         # Potential memory issues / optimizations around here...
-        self.memories: List[List[Memory]] = []
-        self.aux_memories: List[List[AuxMemory]] = []
+        self.memories: List[Memory] = []
 
 
         # # Initialize the ORIGINAL MODEL for a KL divergence term during the Policy Phase
@@ -255,9 +252,7 @@ class PhasicPolicyGradient:
 
     def rollout(self, hard_reset: bool = False):
         """
-        Runs a rollout on the vectorized environments for `num_steps` timesteps and records the memories
-
-        Returns `next_obs` and `next_done` for starting the next section of rollouts
+        Runs a rollout on the environment and records the memories
         """
         start = datetime.now()
 
@@ -292,7 +287,7 @@ class PhasicPolicyGradient:
             obs = next_obs
 
             # Preprocess image
-            agent_obs = self.agent._env_obs_to_agent(obs)
+            agent_obs = self.model._env_obs_to_agent(obs)
 
             # Basically just adds a dimension to both camera and button tensors
             agent_obs = tree_map(lambda x: x.unsqueeze(1), agent_obs)
@@ -335,10 +330,10 @@ class PhasicPolicyGradient:
                     masks = list(
                         map(lambda mem: 1 - float(mem.done), rollout_memories))
 
-                    agent_obs = self.agent._env_obs_to_agent(obs)
+                    agent_obs = self.model._env_obs_to_agent(obs)
                     agent_obs = tree_map(lambda x: x.unsqueeze(1), agent_obs)
-                    pi_distribution, v_prediction, next_policy_hidden_state, next_critic_hidden_state \
-                        = self.pi_and_v(agent_obs, policy_hidden_state, critic_hidden_state, dummy_first)
+                    _, v_prediction, _, _ \
+                        = self.pi_and_v(agent_obs, hidden_state, dummy_first)
                     returns = calculate_gae(
                         rewards, v_preds, masks, self.gamma, self.lam, v_prediction)
 
@@ -416,10 +411,7 @@ class PhasicPolicyGradient:
         for _ in tqdm(range(self.epochs), desc="🧠 Policy Epochs"):
 
             # Note: These are batches, not individual samples
-            for _, _, latent, _, actions, old_action_log_probs, rewards, _, dones, v_old in dl:
-
-                batch_size = len(dones)
-                v_old = v_old.to(device)
+            for _, _, latent, _, actions, old_action_log_probs, rewards, _, _, _ in dl:
                 
                 v_prediction = self.model.get_real_value(latent)
                 pi_distribution = self.model.get_policy(latent)
@@ -465,7 +457,7 @@ class PhasicPolicyGradient:
 
                 if self.plot:
                     self.pi_loss_history.append(policy_loss.mean().item())
-                    self.v_loss_history.append(value_loss.item())
+                    self.v_loss_history.append(value_loss.mean().item())
 
                     self.expl_var_history.append(explained_variance.item())
 
@@ -527,7 +519,7 @@ class PhasicPolicyGradient:
         # Get a dataloader for ALL memories to easily vectorize them
         # as long as there aren't too many memories, this should be fine
         data = MemoryDataset(self.memories)
-        dl = DataLoader(data, batch_size=len(self.memories), shuffle=True)
+        dl = DataLoader(data, batch_size=len(self.memories), shuffle=False)
 
         # This for should only iterate once
         for _, _, latent, _, _, _, _, _, _, _ in dl:
@@ -535,108 +527,47 @@ class PhasicPolicyGradient:
 
         return pi_distribution
                 
-    def auxiliary_phase(self, policy_priors, policy_hidden_states, critic_hidden_states):
+    def auxiliary_phase(self, policy_priors):
         '''
         Run the auxiliary training phase for the value and aux value functions
         '''
-        aux_arr = np.array(self.aux_memories)
-        # TODO plot for this phase too !!
+        # Create dataloader from the memory buffer
+        data = IndexedMemoryDataset(self.memories)
+
+        dl = DataLoader(data, batch_size=self.minibatch_size, shuffle=True)
 
         for _ in tqdm(range(self.sleep_cycles), desc="😴 Auxiliary Epochs"):
 
-            # For training the recurrent model, we do batches of *sequences*
-            # that is why this is `self.num_envs` and not `self.num_envs * self.num_timesteps`
-            inds = np.arange(self.num_envs)
-            np.random.shuffle(inds)
-            minibatches = np.reshape(inds, (self.minibatch_size, self.num_envs // self.minibatch_size))
+            # Note: These are batches, not individual samples
+            for _, _, latent, _, _, _, rewards, _, _, _, idx in dl:
 
-            # Note: These are SEQUENCES, NOT individual STPES
-            for mb_inds in minibatches:
-                rollouts = aux_arr[mb_inds]
+                p_dist_old = {'camera': policy_priors['camera'].index_select(0,idx),
+                              'buttons': policy_priors['buttons'].index_select(0,idx)}
+                v_prediction = self.model.get_real_value(latent)
+                pi_dists = self.model.get_policy(latent)
+                aux_prediction = self.model.get_aux_value(latent)
 
-                ## All of the before the next for loop is to get the correct initial state to 
-                ## start rerolling out the memory, it gave me mean warnings when I didn't
-                ## do it :(
-                if policy_hidden_states[0] is None:
-                    # Initialize the hidden state vector
-                    policy_hidden_states = [self.agent.policy.initial_state(1) for _ in mb_inds]
-                    critic_hidden_states = [self.critic.policy.initial_state(1) for _ in mb_inds]
+                # The returns are stored in the `reward` field in memory, for some reason
+                # TODO do this on the dataset level instead
+                v_targ = normalize(rewards)
+ 
+                # Calculate joint loss
+                aux_loss = 0.5 * (aux_prediction - v_targ.detach()) ** 2
+                kl_term = self.model.policy.pi_head.kl_divergence(
+                    p_dist_old, pi_dists)
+                joint_loss = aux_loss + self.beta_clone * kl_term
 
-                # Get the initial states for the current minibatches
-                # use np.empty for making this because np is dumb
-                mb_policy_states = np.empty(self.num_envs, dtype=object)
-                mb_critic_states = np.empty(self.num_envs, dtype=object)
-
-                mb_policy_states[:] = policy_hidden_states
-                mb_critic_states[:] = critic_hidden_states
-
-                mb_policy_states = mb_policy_states[mb_inds]
-                mb_critic_states = mb_critic_states[mb_inds]
-
-                joint_losses = []
-                value_losses = []
-                for rollout, priors, policy_hidden_state, critic_hidden_state in \
-                    zip(rollouts, policy_priors, mb_policy_states, mb_critic_states):
-
-                    # Want these vectorized for later calculations
-                    v_targ = torch.tensor([mem.v_targ for mem in rollout])
-                    # to vectorize the dists, you have to do it per element in the dict
-                    p_dist_old = {'camera':torch.cat([p_dist['camera'].detach() for p_dist in priors]),
-                                'buttons':torch.cat([p_dist['buttons'].detach() for p_dist in priors]),}
-
-
-
-                    # reroll out the memories using the same initial hidden state
-                    new_values = []
-                    new_pi_dists = []
-                    new_aux_values = []
-                    dummy_first = th.from_numpy(np.array((False,))).unsqueeze(1)
-                    for memory in rollout:
-
-                        agent_obs = memory.agent_obs
-                        pi_distribution, v_prediction, aux_pred, policy_hidden_state, critic_hidden_state \
-                                = self.pi_and_v(agent_obs, policy_hidden_state, critic_hidden_state, dummy_first, use_aux=True)
-                        
-                        new_pi_dists.append(pi_distribution)
-                        new_values.append(v_prediction)
-                        new_aux_values.append(aux_pred)
-
-                        # If we are moving on to a new episode, reset the state
-                        if memory.done:
-                            policy_hidden_state = self.agent.policy.initial_state(1) 
-                            critic_hidden_state = self.critic.policy.initial_state(1)
-
-
-                    pi_dists = {'camera':torch.cat([p_dist['camera'] for p_dist in new_pi_dists]),
-                                'buttons':torch.cat([p_dist['buttons'] for p_dist in new_pi_dists]),}
-                    aux_predication = torch.cat(new_aux_values).squeeze()
-                    v_prediction = torch.cat(new_values).squeeze()
-                            
-                    # Calculate joint loss
-                    aux_loss = 0.5 * (aux_predication - v_targ.detach()) ** 2
-                    kl_term = self.agent.policy.pi_head.kl_divergence(
-                        p_dist_old, pi_dists)
-                    joint_loss = aux_loss + self.beta_clone * kl_term
-                    joint_losses.append(joint_loss)
-
-                    # Calculate unclipped value loss
-                    value_loss = 0.5 * (v_prediction - v_targ.detach()) ** 2
-                    value_losses.append(value_loss)
-
-                # accumulate the loss from the minibatches
-                # even though we consider minibatches of sequences, we are still taking the
-                # mean of the loss calculated for each STEP, so we are not losing out on much
-                joint_loss = torch.cat(joint_losses).mean()
-                value_loss = torch.cat(value_losses).mean()
+                # Calculate unclipped value loss
+                value_loss = 0.5 * (v_prediction - v_targ.detach()) ** 2
 
                 # optimize Ljoint wrt policy weights
                 self.policy_optim.zero_grad()
-                joint_loss.backward()
+                joint_loss.mean().backward()
                 self.policy_optim.step()
 
                 # optimize Lvalue wrt value weights
                 self.critic_optim.zero_grad()
-                value_loss.backward()
+                value_loss.mean().backward()
                 self.critic_optim.step()
 
     def run_train_loop(self):
@@ -646,15 +577,10 @@ class PhasicPolicyGradient:
         if self.plot:
             self.init_plots()
 
-        obss = [None]*self.num_envs
-        dones = [False]*self.num_envs
-        policy_states = [None]*self.num_envs
-        critic_states = [None]*self.num_envs
-
         for i in range(self.num_rollouts):
 
             if i % self.save_every == 0:
-                state_dict = self.agent.policy.state_dict()
+                state_dict = self.model.state_dict()
                 th.save(state_dict, f'{self.out_weights_path}_{i}')
 
                 data_path = f"out/{self.training_name}.csv"
@@ -682,54 +608,33 @@ class PhasicPolicyGradient:
             # At T = 100, this is every 5 episodes
             should_hard_reset = i % 10 == 0 and i != 0
 
-            obss_buffer = []
-            dones_buffer = []
-            policy_states_buffer = []
-            critic_states_buffer = []
-            for env, next_obs, next_done, next_policy_hidden_state, next_critic_hidden_state \
-                  in zip(self.envs, obss, dones, policy_states, critic_states):
-                next_obs, next_done, next_policy_hidden_state, next_critic_hidden_state = self.rollout(
-                    env, next_obs, next_done, next_policy_hidden_state, next_critic_hidden_state, hard_reset=should_hard_reset)
-                obss_buffer.append(next_obs)
-                dones_buffer.append(next_done)
-                policy_states_buffer.append(next_policy_hidden_state)
-                critic_states_buffer.append(next_critic_hidden_state)
+            for _ in range(self.num_envs):
+                self.rollout(hard_reset=should_hard_reset)
 
-            # Need to give initial states from this rollout to re-rollout in learning with LSTM model
-            self.learn_ppo_phase(policy_states, critic_states)
-
-
-            # we have aux memories now, clear this shit OUT
-            self.memories.clear()
+            # GAE is done in here, and memories=aux_memories
+            self.learn_ppo_phase()
 
             # calculate policy priors
             with torch.no_grad():
-                policy_priors = self.calculate_policy_priors(policy_states, critic_states)
+                policy_priors = self.calculate_policy_priors()
 
-            self.auxiliary_phase(policy_priors, policy_states, critic_states)
+            self.auxiliary_phase(policy_priors)
 
-            self.aux_memories.clear()
-
-            # Update from buffers AFTER learning...
-            obss = obss_buffer
-            dones = dones_buffer
-            policy_states = policy_states_buffer
-            critic_states = critic_states_buffer
+            self.memories.clear()
 
 
 if __name__ == "__main__":
 
-    ppg = PhasicPolicyGradient(
+    ppg = EfficientPhasicPolicyGradient(
         env_name="MineRLPunchCowEz-v0",
         model="foundation-model-1x",
         weights="foundation-model-1x",
-        out_weights="cow-deleter-ppo-2ent-1x",
+        out_weights="cow-deleter-ppg-eff-1x",
         save_every=5,
         num_envs=1,
         num_rollouts=500,
-        num_steps=50,
         epochs=1,
-        minibatch_size=1,
+        minibatch_size=48,
         lr=2.5e-5,
         weight_decay=0,
         betas=(0.9, 0.999),
@@ -741,8 +646,8 @@ if __name__ == "__main__":
         lam=0.95,
         beta_klp = 1,
         sleep_cycles=2,
-        beta_clone = 1,
-        mem_buffer_size=10000,
+        beta_clone=1,
+        mem_buffer_size=100000,
         plot=True,
     )
 
