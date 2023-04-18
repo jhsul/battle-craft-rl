@@ -33,7 +33,7 @@ class ConnectionNetwork(nn.Module):
 class EfficientVPT(nn.Module):
 
     def __init__(self, env, device=None, policy_kwargs=None, pi_head_kwargs=None):
-
+        
         if device is None:
             device = 'cpu'
         self.device = th.device(device)
@@ -88,10 +88,7 @@ class EfficientVPT(nn.Module):
         return list[self.value_head.parameters()] + list[self.value_processor.parameters()]
     
     def policy_parameters(self):
-        return list[self.policy.pi_head.parameters()] + list[self.connection_net.parameters()]
-    
-    def aux_parameters(self):
-        return list[self.policy.value_head.parameters()] + list[self.connection_net.parameters()]
+        return list[self.policy.parameters()] + list[self.connection_net.parameters()]
 
     def load_vpt_weights(self, path):
         """

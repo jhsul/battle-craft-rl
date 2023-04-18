@@ -9,7 +9,9 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import copy
+import gc
 
+from efficient_vpt import EfficientVPT
 from datetime import datetime
 from tqdm import tqdm
 from memory import Memory, MemoryDataset, AuxMemory
@@ -73,7 +75,10 @@ class PhasicPolicyGradient:
 
         self.env_name = env_name
         self.num_envs = num_envs
-        self.envs = init_vec_envs(self.env_name, self.num_envs)
+
+        # no more vectorized envs :( just rollout the whole thing instead
+        # The tradeoff for needing to create many servers is NOT worth it!
+        self.env = gym.make(env_name)
 
         self.save_every = save_every
 
@@ -126,28 +131,17 @@ class PhasicPolicyGradient:
 
         # Make our agents
 
-        self.agent = MineRLAgent(self.envs, policy_kwargs=policy_kwargs,
+        self.model = EfficientVPT(self.env, policy_kwargs=policy_kwargs,
                                  pi_head_kwargs=pi_head_kwargs)
-        self.agent.load_weights(weights_path)
+        self.model.load_vpt_weights(weights_path)
 
-        actor = self.agent.policy
-        policy_params = actor.parameters()
-
-        self.optim = th.optim.Adam(
-            policy_params, lr=lr, betas=betas, weight_decay=weight_decay)
+        self.policy_optim = th.optim.Adam(self.model.policy_parameters(), lr=lr, betas=betas, weight_decay=weight_decay)
         
         self.scheduler = th.optim.lr_scheduler.LambdaLR(
-            self.optim, lambda x: 1 - x / num_rollouts)
+            self.policy_optim, lambda x: 1 - x / num_rollouts)
         
-        
-        # Create a SEPARATE VPT agent just for the critic
-        self.critic = MineRLAgent(self.envs, policy_kwargs=policy_kwargs,
-                                pi_head_kwargs=pi_head_kwargs)
-        self.critic.load_weights(weights_path)
-        critic_params = list(self.critic.policy.value_head.parameters()) + list(self.critic.policy.net.parameters())
-
         # separate optimizer for the critic
-        self.critic_optim = th.optim.Adam(critic_params, lr=lr, betas=betas, weight_decay=weight_decay)
+        self.critic_optim = th.optim.Adam(self.model.value_parameters(), lr=lr, betas=betas, weight_decay=weight_decay)
 
         self.scheduler_critic = th.optim.lr_scheduler.LambdaLR(
         self.critic_optim, lambda x: 1 - x / num_rollouts)
@@ -158,12 +152,14 @@ class PhasicPolicyGradient:
         self.memories: List[List[Memory]] = []
         self.aux_memories: List[List[AuxMemory]] = []
 
+        ## leave this for now...
+
         # Initialize the ORIGINAL MODEL for a KL divergence term during the Policy Phase
         # We will use KL divergence between our policy predictions and the original policy
         # This is to ensure that we don't deviate too far from the original policy
         self.orig_agent = MineRLAgent(self.envs, policy_kwargs=policy_kwargs,
                                       pi_head_kwargs=pi_head_kwargs)
-        self.orig_agent.load_weights(weights_path)\
+        self.orig_agent.load_weights(weights_path)
         
         # initialize the hidden states of this agent
         self.orig_hidden_states = {}
@@ -171,37 +167,22 @@ class PhasicPolicyGradient:
             self.orig_hidden_states[i] = self.orig_agent.policy.initial_state(1)
 
 
-    def policy(self):
-        '''
-        Returns the policy network head, aux value head, and base
-        '''
 
-        return self.agent.policy.pi_head, self.agent.policy.value_head, self.agent.policy.net
-
-
-    def value(self):
-        '''
-        Return the current value network  head and base
-        '''
-        return self.critic.policy.value_head, self.critic.policy.net
-
-
-    def pi_and_v(self, agent_obs, policy_hidden_state, value_hidden_state, dummy_first, use_aux=False):
+    def pi_and_v(self, agent_obs, hidden_state, dummy_first, use_aux=False):
         """
         Returns the correct policy and value outputs
         """
-        # Shorthand for networks
-        policy, aux, policy_base = self.policy()
-        value, value_base = self.value()
+        latent, hidden_state_out = self.model.run_vpt_base(agent_obs, hidden_state, dummy_first)
 
-        (pi_h, aux_head), p_state_out = policy_base(
-            agent_obs, policy_hidden_state, context={"first": dummy_first})
-        (_, v_h), v_state_out = value_base(
-            agent_obs, value_hidden_state, context={"first": dummy_first})
+        pi_dist = self.model.get_policy(latent)
+        v_pred = self.model.get_real_value(latent)
         
         if not use_aux:
-            return policy(pi_h), value(v_h), p_state_out, v_state_out
-        return policy(pi_h), value(v_h), aux(aux_head), p_state_out, v_state_out
+            return pi_dist, v_pred, hidden_state_out
+        
+        aux = self.model.get_aux_value(latent)
+
+        return pi_dist, v_pred, aux, hidden_state_out
 
 
     def init_plots(self):
@@ -484,7 +465,7 @@ class PhasicPolicyGradient:
 
                 for rollout, policy_hidden_state, critic_hidden_state, i in \
                     zip(rollouts, mb_policy_states, mb_critic_states, mb_inds):
-
+                    print("entering rollout in learning phase")
                     # Want these vectorized for later calculations
                     rewards = torch.tensor([mem.reward for mem in rollout])
                     old_action_log_probs = torch.tensor([mem.action_log_prob for mem in rollout])
@@ -500,7 +481,8 @@ class PhasicPolicyGradient:
                     dummy_first = th.from_numpy(np.array((False,))).unsqueeze(1)
                     aux_mems = []
                     orig_hidden_state = self.orig_hidden_states[i]
-                    for memory in rollout:
+                    for i, memory in enumerate(rollout):
+                        print(f'\t...looking at memory {i}')
                         # Save the auxillary memories here, too
                         aux_mem = AuxMemory(memory.agent_obs, memory.reward, memory.done)
                         aux_mems.append(aux_mem)
@@ -536,6 +518,10 @@ class PhasicPolicyGradient:
                             policy_hidden_state = self.agent.policy.initial_state(1) 
                             critic_hidden_state = self.critic.policy.initial_state(1)
                             orig_hidden_state = self.orig_agent.policy.initial_state(1)
+                    print("done rollout out")
+                    # del rollout
+                    # gc.collect()
+                    # print("GC done for those memories")
 
                     self.aux_memories.append(aux_mems)
 
@@ -580,16 +566,17 @@ class PhasicPolicyGradient:
                 # mean of the loss calculated for each STEP, so we are not losing out on much
                 policy_loss = torch.cat(policy_losses).mean()
                 value_loss = torch.cat(value_losses).mean()
-
+                print("Starting backprop")
                 # Backprop for policy
-                self.optim.zero_grad()
+                self.policy_optim.zero_grad()
                 policy_loss.backward()
-                self.optim.step()
+                self.policy_optim.step()
 
                 # Backprop for critic
                 self.critic_optim.zero_grad()
                 value_loss.backward()
                 self.critic_optim.step()
+                print('done backprop')
 
                 if self.plot:
                     self.pi_loss_history.append(policy_loss.mean().item())
@@ -777,9 +764,9 @@ class PhasicPolicyGradient:
                 value_loss = torch.cat(value_losses).mean()
 
                 # optimize Ljoint wrt policy weights
-                self.optim.zero_grad()
+                self.policy_optim.zero_grad()
                 joint_loss.backward()
-                self.optim.step()
+                self.policy_optim.step()
 
                 # optimize Lvalue wrt value weights
                 self.critic_optim.zero_grad()
