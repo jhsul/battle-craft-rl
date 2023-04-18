@@ -26,9 +26,10 @@ class ConnectionNetwork(nn.Module):
                                           latent_size)
         
     def forward(self, latent):
+        orig = latent
         latent = th.relu(self.connection_layer1(latent))
         latent = th.relu(self.connection_layer2(latent))
-        return latent
+        return latent + orig
 
 class EfficientVPT(nn.Module):
 
