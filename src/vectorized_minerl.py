@@ -4,11 +4,13 @@ import numpy as np
 from util import safe_reset
 from memory import Memory
 
+
 def init_vec_envs(name: str, num_envs: int):
     """
     Return num_envs copies of the given mineRL env
     """
     return [gym.make(name) for _ in range(num_envs)]
+
 
 def reset_vec_envs(envs):
     """
@@ -19,7 +21,7 @@ def reset_vec_envs(envs):
     """
     return [env.reset() for env in envs]
 
-    
+
 def run_base_vec_envs(agent_obss, hidden_states, agent, device):
     """
     Runs the base (assume untrained) VPT model on the envs and returns the
@@ -48,10 +50,8 @@ def run_base_vec_envs(agent_obss, hidden_states, agent, device):
             v_prediction = agent.policy.value_head(v_h)
             vs.append(v_prediction)
             states.append(next_hidden_state)
-    
-    return pihs, vhs, pis, vs, states
-    
 
+    return pihs, vhs, pis, vs, states
 
 
 def step_vec_envs(envs, actions):
@@ -78,21 +78,14 @@ def step_vec_envs(envs, actions):
         obss.append(obs)
         rewards.append(rewards)
         dones.append(done)
-    
+
     return obs, rewards, dones
 
 
 def generate_vec_memories(agent_obss, hidden_states, pi_hs, v_hs, actions, action_log_probs,
-                            rewards, dones, v_preds):
+                          rewards, dones, v_preds):
     return [Memory(agent_obs, hidden_state, pi_h, v_h, action, action_log_prob,
-                            reward, 0, done, v_prediction) for agent_obs, hidden_state, pi_h, v_h, 
-                            action, action_log_prob, reward, done, v_prediction in 
-                            zip(agent_obss, hidden_states, pi_hs, v_hs, 
-                            actions, action_log_probs, rewards, dones, v_preds)]
-    
-        
-            
-
-    
-
-    
+                   reward, 0, done, v_prediction) for agent_obs, hidden_state, pi_h, v_h,
+            action, action_log_prob, reward, done, v_prediction in
+            zip(agent_obss, hidden_states, pi_hs, v_hs,
+                actions, action_log_probs, rewards, dones, v_preds)]
