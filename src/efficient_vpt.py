@@ -17,9 +17,9 @@ from lib.torch_util import default_device_type, set_default_torch_device
 from agent import ACTION_TRANSFORMER_KWARGS, POLICY_KWARGS, PI_HEAD_KWARGS, AGENT_RESOLUTION, resize_image
 
 class ConnectionNetwork(nn.Module):
-    def __init__(self, latent_size):
+    def __init__(self, latent_size, use_skip=False):
         super(ConnectionNetwork, self).__init__()
-
+        self.use_skip = use_skip
         self.connection_layer1 = nn.Linear(latent_size,
                                           latent_size)
         self.connection_layer2 = nn.Linear(latent_size,
@@ -29,11 +29,13 @@ class ConnectionNetwork(nn.Module):
         orig = latent
         latent = th.relu(self.connection_layer1(latent))
         latent = th.relu(self.connection_layer2(latent))
-        return latent + orig
+        if self.use_skip:
+            return latent + orig
+        return latent
 
 class EfficientVPT(nn.Module):
 
-    def __init__(self, env, device=None, policy_kwargs=None, pi_head_kwargs=None):
+    def __init__(self, env, device=None, policy_kwargs=None, pi_head_kwargs=None, use_skip=None):
         super(EfficientVPT, self).__init__()
         if device is None:
             device = 'cpu'
@@ -59,13 +61,13 @@ class EfficientVPT(nn.Module):
 
         # Just a "continuation" layer between them
         # TODO Use a residual connection here?
-        self.connection_net = ConnectionNetwork(self.policy.net.output_latent_size())
+        self.connection_net = ConnectionNetwork(self.policy.net.output_latent_size(), use_skip)
 
         def make_value_head(v_out_size: int, norm_type: str = "ewma", norm_kwargs: Optional[Dict] = None):
             return ScaledMSEHead(v_out_size, 1, norm_type=norm_type, norm_kwargs=norm_kwargs)
         
         self.value_head = make_value_head(self.policy.net.output_latent_size())
-        self.value_processor = ConnectionNetwork(self.policy.net.output_latent_size())
+        self.value_processor = ConnectionNetwork(self.policy.net.output_latent_size(), use_skip)
         
     def run_vpt_base(self, agent_obs, hidden_state, dummy_first):
         (latent, _), hidden_state_out = self.policy.net(

@@ -19,10 +19,10 @@ class Memory:
     v_h: th.tensor
     action: np.ndarray
     action_log_prob: np.ndarray
-    reward: float
+    returns: float
     total_reward: float
     done: bool
-    value: float
+    advantage: float
 
 
 @dataclass
@@ -54,7 +54,7 @@ class MemoryDataset(Dataset):
         mem = self.memories[idx]
 
         # This needs to be returned as a tuple
-        return mem.agent_obs, mem.hidden_state, mem.pi_h, mem.v_h, mem.action, mem.action_log_prob, mem.reward, mem.total_reward, mem.done, mem.value
+        return mem.agent_obs, mem.hidden_state, mem.pi_h, mem.v_h, mem.action, mem.action_log_prob, mem.returns, mem.total_reward, mem.done, mem.advantage
 
 class IndexedMemoryDataset(Dataset):
     """
@@ -72,7 +72,7 @@ class IndexedMemoryDataset(Dataset):
         mem = self.memories[idx]
 
         # This needs to be returned as a tuple
-        return mem.agent_obs, mem.hidden_state, mem.pi_h, mem.v_h, mem.action, mem.action_log_prob, mem.reward, mem.total_reward, mem.done, mem.value, idx
+        return mem.agent_obs, mem.hidden_state, mem.pi_h, mem.v_h, mem.action, mem.action_log_prob, mem.returns, mem.total_reward, mem.done, mem.advantage, idx
 
 
 

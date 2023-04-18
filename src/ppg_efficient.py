@@ -15,7 +15,7 @@ from efficient_vpt import EfficientVPT
 from datetime import datetime
 from tqdm import tqdm
 from memory import Memory, MemoryDataset, AuxMemory, IndexedMemoryDataset
-from util import to_torch_tensor, normalize, safe_reset, hard_reset, calculate_gae
+from util import to_torch_tensor, normalize, safe_reset, hard_reset, returns_and_advantages
 from vectorized_minerl import *
 
 sys.path.insert(0, "vpt")  # nopep8
@@ -130,7 +130,7 @@ class EfficientPhasicPolicyGradient:
         # Make our agents
 
         self.model = EfficientVPT(self.env, policy_kwargs=policy_kwargs,
-                                 pi_head_kwargs=pi_head_kwargs)
+                                 pi_head_kwargs=pi_head_kwargs, use_skip=True)
         self.model.load_vpt_weights(weights_path)
 
         self.policy_optim = th.optim.Adam(self.model.policy_parameters(), lr=lr, betas=betas, weight_decay=weight_decay)
@@ -224,7 +224,7 @@ class EfficientPhasicPolicyGradient:
         # Setup explained variance plot
         self.main_ax[1, 1].set_autoscale_on(True)
         self.main_ax[1, 1].autoscale_view(True, True, True)
-        self.main_ax[1, 1].set_title("Explained Vaiance")
+        self.main_ax[1, 1].set_title("Explained Variance")
 
         self.expl_var_plot, = self.main_ax[1, 1].plot([], [], color="grey")
 
@@ -246,7 +246,7 @@ class EfficientPhasicPolicyGradient:
         self.live_value_plot, = self.live_ax.plot(
             [], [], color="blue", label="Value")
         self.live_gae_plot, = self.live_ax.plot(
-            [], [], color="green", label="GAE")
+            [], [], color="green", label="V_targ")
 
         self.live_ax.legend(loc="upper right")
 
@@ -325,17 +325,14 @@ class EfficientPhasicPolicyGradient:
             if self.plot:
                 with torch.no_grad():
                     # Calculate the GAE up to this point
-                    v_preds = list(map(lambda mem: mem.value, rollout_memories))
-                    rewards = list(map(lambda mem: mem.reward, rollout_memories))
+                    # TODO I imagine this makes this quite slow...
+                    v_preds = np.array(list(map(lambda mem: mem.advantage, rollout_memories)))
+                    rewards = np.array(list(map(lambda mem: mem.returns, rollout_memories)))
                     masks = list(
                         map(lambda mem: 1 - float(mem.done), rollout_memories))
 
-                    agent_obs = self.model._env_obs_to_agent(obs)
-                    agent_obs = tree_map(lambda x: x.unsqueeze(1), agent_obs)
-                    _, v_prediction, _, _ \
-                        = self.pi_and_v(agent_obs, hidden_state, dummy_first)
-                    returns = calculate_gae(
-                        rewards, v_preds, masks, self.gamma, self.lam, v_prediction)
+                    returns, advantages = returns_and_advantages(
+                        normalize(rewards), v_preds, masks, self.gamma, self.lam)
 
                     # Update data
                     self.live_reward_history.append(reward)
@@ -363,24 +360,21 @@ class EfficientPhasicPolicyGradient:
                     self.live_fig.canvas.flush_events()
 
         # Calculate the generalized advantage estimate
-        v_preds = list(map(lambda mem: mem.value, rollout_memories))
-        rewards = list(map(lambda mem: mem.reward, rollout_memories))
+        v_preds = np.array(list(map(lambda mem: mem.advantage, rollout_memories)))
+        rewards = np.array(list(map(lambda mem: mem.returns, rollout_memories)))
         masks = list(map(lambda mem: 1 - float(mem.done), rollout_memories))
 
         with torch.no_grad():
-            agent_obs = self.model._env_obs_to_agent(obs)
-            agent_obs = tree_map(lambda x: x.unsqueeze(1), agent_obs)
-            _, v_prediction, _, _ \
-                = self.pi_and_v(agent_obs, hidden_state, dummy_first)
-            returns = calculate_gae(rewards, v_preds, masks, self.gamma, self.lam, v_prediction)
+            returns, advantages = returns_and_advantages(normalize(rewards), v_preds, masks, self.gamma, self.lam)
 
         # Make changes to the memories for this episode before adding them to main buffer
         for i in range(len(rollout_memories)):
             # Replace raw reward with the GAE
-            rollout_memories[i].reward = returns[i]
+            rollout_memories[i].returns = returns[i]
+            rollout_memories[i].advantage = advantages[i]
 
             # Remember the total reward for this episode
-            rollout_memories[i].total_reward = episode_reward # TODO this is broken for PPG!
+            rollout_memories[i].total_reward = episode_reward
 
         # Update internal memory buffer
         self.memories.extend(rollout_memories)
@@ -411,7 +405,7 @@ class EfficientPhasicPolicyGradient:
         for _ in tqdm(range(self.epochs), desc="🧠 Policy Epochs"):
 
             # Note: These are batches, not individual samples
-            for _, _, latent, _, actions, old_action_log_probs, rewards, _, _, _ in dl:
+            for _, _, latent, _, actions, old_action_log_probs, returns, _, _, advantages in dl:
                 
                 v_prediction = self.model.get_real_value(latent)
                 pi_distribution = self.model.get_policy(latent)
@@ -425,9 +419,6 @@ class EfficientPhasicPolicyGradient:
                 entropy = self.model.policy.pi_head.entropy(
                     pi_distribution).to(device)
 
-                # The returns are stored in the `reward` field in memory, for some reason
-                returns = normalize(rewards)
-
                 # Calculate the explained variance, to see how accurate the GAE really is...
                 explained_variance = 1 - \
                     th.sub(returns, v_prediction).var() / returns.var()
@@ -435,7 +426,7 @@ class EfficientPhasicPolicyGradient:
                 # Calculate clipped surrogate objective loss
                 ratios = (action_log_probs -
                         old_action_log_probs).exp().to(device)
-                advantages = returns - v_prediction.detach().to(device)
+                
                 surr1 = ratios * advantages
                 surr2 = ratios.clamp(
                     1 - self.eps_clip, 1 + self.eps_clip) * advantages
@@ -631,9 +622,9 @@ if __name__ == "__main__":
         weights="foundation-model-1x",
         out_weights="cow-deleter-ppg-eff-1x",
         save_every=5,
-        num_envs=1,
+        num_envs=5,
         num_rollouts=500,
-        epochs=1,
+        epochs=5,
         minibatch_size=48,
         lr=2.5e-5,
         weight_decay=0,
@@ -645,7 +636,7 @@ if __name__ == "__main__":
         gamma=0.99,
         lam=0.95,
         beta_klp = 1,
-        sleep_cycles=2,
+        sleep_cycles=10,
         beta_clone=1,
         mem_buffer_size=100000,
         plot=True,

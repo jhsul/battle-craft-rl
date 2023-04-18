@@ -16,7 +16,7 @@ from torch.utils.tensorboard import SummaryWriter
 from datetime import datetime
 from tqdm import tqdm
 from memory import Memory, MemoryDataset, AuxMemory
-from util import to_torch_tensor, normalize, safe_reset, hard_reset, calculate_gae
+from util import to_torch_tensor, normalize, safe_reset, hard_reset, returns_and_advantages
 from vectorized_minerl import *
 
 sys.path.insert(0, "vpt")  # nopep8
@@ -321,9 +321,9 @@ class PhasicPolicyGradient:
                 with torch.no_grad():
                     # Calculate the GAE up to this point
                     v_preds = list(
-                        map(lambda mem: mem.value, rollout_memories))
+                        map(lambda mem: mem.advantage, rollout_memories))
                     rewards = list(
-                        map(lambda mem: mem.reward, rollout_memories))
+                        map(lambda mem: mem.returns, rollout_memories))
                     masks = list(
                         map(lambda mem: 1 - float(mem.done), rollout_memories))
 
@@ -331,7 +331,7 @@ class PhasicPolicyGradient:
                     agent_obs = tree_map(lambda x: x.unsqueeze(1), agent_obs)
                     pi_distribution, v_prediction, next_policy_hidden_state, next_critic_hidden_state \
                         = self.pi_and_v(agent_obs, policy_hidden_state, critic_hidden_state, dummy_first)
-                    returns = calculate_gae(
+                    returns = returns_and_advantages(
                         rewards, v_preds, masks, self.gamma, self.lam, v_prediction)
 
                     # Update data
@@ -360,8 +360,8 @@ class PhasicPolicyGradient:
                     self.live_fig.canvas.flush_events()
 
         # Calculate the generalized advantage estimate
-        v_preds = list(map(lambda mem: mem.value, rollout_memories))
-        rewards = list(map(lambda mem: mem.reward, rollout_memories))
+        v_preds = list(map(lambda mem: mem.advantage, rollout_memories))
+        rewards = list(map(lambda mem: mem.returns, rollout_memories))
         masks = list(map(lambda mem: 1 - float(mem.done), rollout_memories))
 
         with torch.no_grad():
@@ -369,13 +369,13 @@ class PhasicPolicyGradient:
             agent_obs = tree_map(lambda x: x.unsqueeze(1), agent_obs)
             pi_distribution, v_prediction, next_policy_hidden_state, next_critic_hidden_state \
                 = self.pi_and_v(agent_obs, policy_hidden_state, critic_hidden_state, dummy_first)
-            returns = calculate_gae(
+            returns = returns_and_advantages(
                 rewards, v_preds, masks, self.gamma, self.lam, v_prediction)
 
         # Make changes to the memories for this episode before adding them to main buffer
         for i in range(len(rollout_memories)):
             # Replace raw reward with the GAE
-            rollout_memories[i].reward = returns[i]
+            rollout_memories[i].returns = returns[i]
 
             # Remember the total reward for this episode
             # TODO this is broken for PPG!

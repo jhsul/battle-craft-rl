@@ -16,7 +16,7 @@ import copy
 from datetime import datetime
 from tqdm import tqdm
 from memory import Memory, MemoryDataset
-from util import to_torch_tensor, normalize, safe_reset, hard_reset, calculate_gae
+from util import to_torch_tensor, normalize, safe_reset, hard_reset, returns_and_advantages
 from vectorized_minerl import *
 
 sys.path.insert(0, "vpt")  # nopep8
@@ -285,12 +285,12 @@ class ProximalPolicyOptimizer:
 
             if self.plot:
                 # Calculate the GAE up to this point
-                v_preds = list(map(lambda mem: mem.value, rollout_memories))
-                rewards = list(map(lambda mem: mem.reward, rollout_memories))
+                v_preds = list(map(lambda mem: mem.advantage, rollout_memories))
+                rewards = list(map(lambda mem: mem.returns, rollout_memories))
                 masks = list(
                     map(lambda mem: 1 - float(mem.done), rollout_memories))
 
-                returns = calculate_gae(
+                returns = returns_and_advantages(
                     rewards, v_preds, masks, self.gamma, self.lam)
 
                 # Update data
@@ -328,16 +328,16 @@ class ProximalPolicyOptimizer:
         # randomized minibatch would just be nonsense...
 
         # TODO need to use next_obs and next_done for this
-        v_preds = list(map(lambda mem: mem.value, rollout_memories))
-        rewards = list(map(lambda mem: mem.reward, rollout_memories))
+        v_preds = list(map(lambda mem: mem.advantage, rollout_memories))
+        rewards = list(map(lambda mem: mem.returns, rollout_memories))
         masks = list(map(lambda mem: 1 - float(mem.done), rollout_memories))
 
-        returns = calculate_gae(rewards, v_preds, masks, self.gamma, self.lam)
+        returns = returns_and_advantages(rewards, v_preds, masks, self.gamma, self.lam)
 
         # Make changes to the memories for this episode before adding them to main buffer
         for i in range(len(rollout_memories)):
             # Replace raw reward with the GAE
-            rollout_memories[i].reward = returns[i]
+            rollout_memories[i].returns = returns[i]
 
             # Remember the total reward for this episode
             rollout_memories[i].total_reward = episode_reward
