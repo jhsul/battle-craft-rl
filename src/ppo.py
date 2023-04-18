@@ -371,7 +371,6 @@ class ProximalPolicyOptimizer:
         # Create dataloader from the memory buffer
         data = MemoryDataset(self.memories)
 
-        # TODO should not be shuffling, rather rolling out again
         dl = DataLoader(data, batch_size=self.minibatch_size, shuffle=True)
 
         # Shorthand

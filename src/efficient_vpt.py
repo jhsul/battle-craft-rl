@@ -14,7 +14,7 @@ from lib.policy import MinecraftAgentPolicy
 from lib.scaled_mse_head import ScaledMSEHead
 
 from lib.torch_util import default_device_type, set_default_torch_device
-from vpt.agent import ACTION_TRANSFORMER_KWARGS, POLICY_KWARGS, PI_HEAD_KWARGS
+from vpt.agent import ACTION_TRANSFORMER_KWARGS, POLICY_KWARGS, PI_HEAD_KWARGS, AGENT_RESOLUTION, resize_image
 
 class ConnectionNetwork(nn.Module):
     def __init__(self, latent_size):
@@ -89,6 +89,39 @@ class EfficientVPT(nn.Module):
     
     def policy_parameters(self):
         return list[self.policy.parameters()] + list[self.connection_net.parameters()]
+    
+    def initial_state(self, minibatch_size: int):
+        return self.policy.initial_state(minibatch_size)
+    
+    # Need these shits here since I am not using the MineRLAgent class with this!
+    
+    def _agent_action_to_env(self, agent_action):
+        """Turn output from policy into action for MineRL"""
+        # This is quite important step (for some reason).
+        # For the sake of your sanity, remember to do this step (manual conversion to numpy)
+        # before proceeding. Otherwise, your agent might be a little derp.
+        action = agent_action
+        if isinstance(action["buttons"], th.Tensor):
+            action = {
+                "buttons": agent_action["buttons"].cpu().numpy(),
+                "camera": agent_action["camera"].cpu().numpy()
+                # "buttons": agent_action["buttons"].cpu().detach().numpy(),
+                # "camera": agent_action["camera"].cpu().detach().numpy()
+            }
+        minerl_action = self.action_mapper.to_factored(action)
+        minerl_action_transformed = self.action_transformer.policy2env(
+            minerl_action)
+        return minerl_action_transformed
+    
+    def _env_obs_to_agent(self, minerl_obs):
+        """
+        Turn observation from MineRL environment into model's observation
+
+        Returns torch tensors.
+        """
+        agent_input = resize_image(minerl_obs["pov"], AGENT_RESOLUTION)[None]
+        agent_input = {"img": th.from_numpy(agent_input).to(self.device)}
+        return agent_input
 
     def load_vpt_weights(self, path):
         """
