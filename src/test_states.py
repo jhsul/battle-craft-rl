@@ -309,8 +309,8 @@ if __name__ == "__main__":
     print(f"Using models/foundation-model-{model_weights_num}x.weights")
 
     testor = Testor(
-        # "MineRLPunchCowEz-v0",
-        "MineRLPunchCow-v0",
+        "MineRLPunchCowEz-v0",
+        # "MineRLPunchCow-v0",
         f"models/foundation-model-{model_weights_num}x.model",
         f"weights/foundation-model-{model_weights_num}x.weights",
         rc=rc,
