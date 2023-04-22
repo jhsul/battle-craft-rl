@@ -4,6 +4,7 @@ notebooks/logs
 models/*
 weights/*
 out/*
+noted_weights/*
 
 
 logs/

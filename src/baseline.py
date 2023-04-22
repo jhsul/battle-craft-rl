@@ -31,9 +31,9 @@ def main(
 ):
     env_name = env
     model_path = f"models/{model}.model"
-    weights_path = f"weights/{weights}.weights"
+    weights_path = f"noted_weights/{weights}.weights"
 
-    baseline_name = f"baseline-{env_name}-{weights}-{int(time.time())}"
+    baseline_name = f"{env_name}&{model}&{weights}-2"
 
     print(f"Beginning baseline (n={n})")
     print("============================")
@@ -64,10 +64,10 @@ def main(
     damage = []
 
     for eps in tqdm(range(n)):
-        # Hard reset every 10 episodes so we don't crash
-        if eps % 10 == 0 and eps > 0:
-            env.close()
-            env = gym.make(env_name)
+        # # Hard reset every 10 episodes so we don't crash
+        # if eps % 10 == 0 and eps > 0:
+        #     env.close()
+        #     env = gym.make(env_name)
 
         agent.reset()
         obs = env.reset()

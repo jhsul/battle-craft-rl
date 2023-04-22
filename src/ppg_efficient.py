@@ -134,7 +134,7 @@ class EfficientPhasicPolicyGradient:
 
         self.model = EfficientVPT(self.env, policy_kwargs=policy_kwargs,
                                  pi_head_kwargs=pi_head_kwargs, use_skip=True)
-        self.model.load_vpt_weights(weights_path)
+        self.model.load_weights(weights_path)
 
         self.policy_optim = th.optim.Adam(self.model.policy_parameters(), lr=lr, betas=betas, weight_decay=weight_decay)
         
@@ -607,7 +607,7 @@ class EfficientPhasicPolicyGradient:
 
         for _ in range(self.num_phases):
             # hard reset and save every new set of phases
-            should_hard_reset = True
+            should_hard_reset = False
             state_dict = self.model.state_dict()
             th.save(state_dict, f'{self.out_weights_path}_{_}')
 
@@ -654,7 +654,7 @@ if __name__ == "__main__":
     ppg = EfficientPhasicPolicyGradient(
         env_name="MineRLPunchCowEz-v0",
         model="foundation-model-1x",
-        weights="foundation-model-1x",
+        weights="cow-deleter-ppg-eff-yes-norm-kl-5clipping-old-value-1x-PUNCH-DOWN",
         out_weights=f"cow-deleter-ppg-eff-yes-norm-kl-5clipping-old-value-1x{time.time()}",
         save_every=5,
         num_envs=5,
@@ -662,7 +662,7 @@ if __name__ == "__main__":
         num_phases=100,
         epochs=1,
         minibatch_size=48,
-        lr=2.5e-5,
+        lr=2.5e-6,
         weight_decay=0,
         betas=(0.9, 0.999),
         beta_s=0, # no entropy in fine tuning!
@@ -672,7 +672,7 @@ if __name__ == "__main__":
         gamma=0.99,
         lam=0.95,
         beta_klp = 1,
-        sleep_cycles=10,
+        sleep_cycles=5,
         beta_clone=1,
         mem_buffer_size=100000,
         plot=True,
