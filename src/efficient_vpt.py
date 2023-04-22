@@ -72,20 +72,25 @@ class EfficientVPT(nn.Module):
     def run_vpt_base(self, agent_obs, hidden_state, dummy_first):
         (latent, _), hidden_state_out = self.policy.net(
             agent_obs, hidden_state, context={"first": dummy_first})
-        
         return latent, hidden_state_out
 
-    def get_real_value(self, latent):
+    def get_real_value(self, latent, normalize=True):
         latent = self.value_processor(latent)
-        return self.value_head(latent)
+        v = self.value_head(latent)
+        if not normalize:
+            return v
+        return self.value_head.normalize(v)
     
     def get_policy(self, latent):
         latent = self.connection_net(latent)
         return self.policy.pi_head(latent)
     
-    def get_aux_value(self, latent):
+    def get_aux_value(self, latent, normalize=True):
         latent = self.connection_net(latent)
-        return self.policy.value_head(latent)
+        av = self.policy.value_head(latent)
+        if not normalize:
+            return av
+        return self.policy.value_head.normalize(av)
     
     def value_parameters(self):
         return list(self.value_head.parameters()) + list(self.value_processor.parameters())

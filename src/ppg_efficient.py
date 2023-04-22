@@ -15,7 +15,7 @@ from efficient_vpt import EfficientVPT
 from datetime import datetime
 from tqdm import tqdm
 from memory import Memory, MemoryDataset, AuxMemory, IndexedMemoryDataset
-from util import to_torch_tensor, normalize, safe_reset, hard_reset, returns_and_advantages
+from util import to_torch_tensor, safe_reset, hard_reset, returns_and_advantages, normalize
 from vectorized_minerl import *
 
 sys.path.insert(0, "vpt")  # nopep8
@@ -56,6 +56,7 @@ class EfficientPhasicPolicyGradient:
             gamma: float,
             lam: float,
             beta_klp: float,
+            num_phases,
 
 
             mem_buffer_size: int,
@@ -82,7 +83,7 @@ class EfficientPhasicPolicyGradient:
         self.save_every = save_every
 
         # Load hyperparameters unchanged
-        self.num_rollouts = num_rollouts
+        self.N_pi = num_rollouts
         self.epochs = epochs
         self.minibatch_size = minibatch_size
         self.lr = lr
@@ -97,6 +98,8 @@ class EfficientPhasicPolicyGradient:
         self.beta_klp = beta_klp
         self.sleep_cycles = sleep_cycles
         self.beta_clone = beta_clone
+        self.num_phases = num_phases
+        self.saved_rewards = [-199]
 
         self.plot = plot
 
@@ -148,19 +151,17 @@ class EfficientPhasicPolicyGradient:
         # This will be a relatively large chunk of data
         # Potential memory issues / optimizations around here...
         self.memories: List[Memory] = []
+        # self.prioritized_memories = []
+        # self.best_reward_so_far = -199
 
 
-        # # Initialize the ORIGINAL MODEL for a KL divergence term during the Policy Phase
-        # # We will use KL divergence between our policy predictions and the original policy
-        # # This is to ensure that we don't deviate too far from the original policy
-        # self.orig_agent = MineRLAgent(self.envs, policy_kwargs=policy_kwargs,
-        #                               pi_head_kwargs=pi_head_kwargs)
-        # self.orig_agent.load_weights(weights_path)
+        # Initialize the ORIGINAL MODEL for a KL divergence term during the Policy Phase
+        # We will use KL divergence between our policy predictions and the original policy
+        # This is to ensure that we don't deviate too far from the original policy
+        self.orig_agent = MineRLAgent(self.env, policy_kwargs=policy_kwargs,
+                                      pi_head_kwargs=pi_head_kwargs)
+        self.orig_agent.load_weights(weights_path)
         
-        # # initialize the hidden states of this agent
-        # self.orig_hidden_states = {}
-        # for i in range(self.num_envs):
-        #     self.orig_hidden_states[i] = self.orig_agent.policy.initial_state(1)
 
 
 
@@ -327,12 +328,12 @@ class EfficientPhasicPolicyGradient:
                     # Calculate the GAE up to this point
                     # TODO I imagine this makes this quite slow...
                     v_preds = np.array(list(map(lambda mem: mem.advantage, rollout_memories)))
-                    rewards = np.array(list(map(lambda mem: mem.returns, rollout_memories)))
+                    rewards = normalize(np.array(list(map(lambda mem: mem.returns, rollout_memories))))
                     masks = list(
                         map(lambda mem: 1 - float(mem.done), rollout_memories))
 
                     returns, advantages = returns_and_advantages(
-                        normalize(rewards), v_preds, masks, self.gamma, self.lam)
+                        rewards, v_preds, masks, self.gamma, self.lam)
 
                     # Update data
                     self.live_reward_history.append(reward)
@@ -361,11 +362,11 @@ class EfficientPhasicPolicyGradient:
 
         # Calculate the generalized advantage estimate
         v_preds = np.array(list(map(lambda mem: mem.advantage, rollout_memories)))
-        rewards = np.array(list(map(lambda mem: mem.returns, rollout_memories)))
+        rewards = normalize(np.array(list(map(lambda mem: mem.returns, rollout_memories))))
         masks = list(map(lambda mem: 1 - float(mem.done), rollout_memories))
 
         with torch.no_grad():
-            returns, advantages = returns_and_advantages(normalize(rewards), v_preds, masks, self.gamma, self.lam)
+            returns, advantages = returns_and_advantages(rewards, v_preds, masks, self.gamma, self.lam)
 
         # Make changes to the memories for this episode before adding them to main buffer
         for i in range(len(rollout_memories)):
@@ -378,6 +379,12 @@ class EfficientPhasicPolicyGradient:
 
         # Update internal memory buffer
         self.memories.extend(rollout_memories)
+
+        # # save the best memories for extra use in training the value function
+        # if episode_reward >= np.median(np.array(self.saved_rewards)):
+        #     self.prioritized_memories.extend(rollout_memories)
+        #     self.saved_rewards.append(episode_reward)
+        #     # TODO find some method for clearing this shit out
 
         if self.plot:
             # Update the reward plot
@@ -394,11 +401,14 @@ class EfficientPhasicPolicyGradient:
         end = datetime.now()
         print(
             f"✅ Rollout finished (duration: {end - start} | memories: {len(rollout_memories)} | total reward: {episode_reward})")
+        
+        return rollout_memories
 
-    def learn_ppo_phase(self):
+
+    def learn_ppo_phase(self, memories):
 
         # Create dataloader from the memory buffer
-        data = MemoryDataset(self.memories)
+        data = MemoryDataset(memories)
 
         dl = DataLoader(data, batch_size=self.minibatch_size, shuffle=True)
 
@@ -409,6 +419,8 @@ class EfficientPhasicPolicyGradient:
                 
                 v_prediction = self.model.get_real_value(latent)
                 pi_distribution = self.model.get_policy(latent)
+                orig_pi_dists = self.orig_agent.policy.pi_head(latent)
+                v_orig = self.orig_agent.policy.value_head(latent)
 
 
                 action_log_probs = self.model.policy.get_logprob_of_action(
@@ -430,20 +442,22 @@ class EfficientPhasicPolicyGradient:
                 surr1 = ratios * advantages
                 surr2 = ratios.clamp(
                     1 - self.eps_clip, 1 + self.eps_clip) * advantages
-                # kl_term = self.agent.policy.pi_head.kl_divergence(orig_pi_dists, pi_dists)
-                policy_loss = - th.min(surr1, surr2) - self.beta_s * entropy # - self.beta_klp * kl_term
+                kl_term = self.model.policy.pi_head.kl_divergence(orig_pi_dists, pi_distribution)
+                policy_loss = - th.min(surr1, surr2) - self.beta_s * entropy + self.beta_klp * kl_term
 
-                # Calculate unclipped value loss
-                value_loss = 0.5 * (v_prediction.squeeze() - returns) ** 2
+                # Calculate unclipped value loss with a penalty term for deviating from the original
+                value_loss = 0.5 * ((v_prediction.squeeze() - returns) ** 2 + (v_prediction - v_orig)**2)
 
                 # Backprop for policy
                 self.policy_optim.zero_grad()
                 policy_loss.mean().backward()
+                torch.nn.utils.clip_grad_norm_(self.model.policy_parameters(), 5)
                 self.policy_optim.step()
 
                 # Backprop for critic
                 self.critic_optim.zero_grad()
                 value_loss.mean().backward()
+                torch.nn.utils.clip_grad_norm_(self.model.value_parameters(), 5)
                 self.critic_optim.step()
 
                 if self.plot:
@@ -500,7 +514,7 @@ class EfficientPhasicPolicyGradient:
         self.scheduler.step()
         self.scheduler_critic.step()
 
-    def calculate_policy_priors(self):
+    def calculate_policy_priors(self, memories):
         '''
         Calculate the p_dist for the current policy for KL loss in the aux phase
 
@@ -509,7 +523,7 @@ class EfficientPhasicPolicyGradient:
 
         # Get a dataloader for ALL memories to easily vectorize them
         # as long as there aren't too many memories, this should be fine
-        data = MemoryDataset(self.memories)
+        data = MemoryDataset(memories)
         dl = DataLoader(data, batch_size=len(self.memories), shuffle=False)
 
         # This for should only iterate once
@@ -518,12 +532,12 @@ class EfficientPhasicPolicyGradient:
 
         return pi_distribution
                 
-    def auxiliary_phase(self, policy_priors):
+    def auxiliary_phase(self, memories, policy_priors):
         '''
         Run the auxiliary training phase for the value and aux value functions
         '''
         # Create dataloader from the memory buffer
-        data = IndexedMemoryDataset(self.memories)
+        data = IndexedMemoryDataset(memories)
 
         dl = DataLoader(data, batch_size=self.minibatch_size, shuffle=True)
 
@@ -537,10 +551,10 @@ class EfficientPhasicPolicyGradient:
                 v_prediction = self.model.get_real_value(latent)
                 pi_dists = self.model.get_policy(latent)
                 aux_prediction = self.model.get_aux_value(latent)
+                v_orig = self.orig_agent.policy.value_head(latent)
 
                 # The returns are stored in the `reward` field in memory, for some reason
-                # TODO do this on the dataset level instead
-                v_targ = normalize(rewards)
+                v_targ = rewards
  
                 # Calculate joint loss
                 aux_loss = 0.5 * (aux_prediction - v_targ.detach()) ** 2
@@ -549,17 +563,39 @@ class EfficientPhasicPolicyGradient:
                 joint_loss = aux_loss + self.beta_clone * kl_term
 
                 # Calculate unclipped value loss
-                value_loss = 0.5 * (v_prediction - v_targ.detach()) ** 2
+                value_loss = 0.5 * ((v_prediction - v_targ.detach()) ** 2 + (v_prediction - v_orig)**2)
 
                 # optimize Ljoint wrt policy weights
                 self.policy_optim.zero_grad()
                 joint_loss.mean().backward()
+                torch.nn.utils.clip_grad_norm_(self.model.policy_parameters(), 5)
                 self.policy_optim.step()
 
                 # optimize Lvalue wrt value weights
                 self.critic_optim.zero_grad()
                 value_loss.mean().backward()
+                torch.nn.utils.clip_grad_norm_(self.model.value_parameters(), 5)
                 self.critic_optim.step()
+
+
+        # data = IndexedMemoryDataset(self.prioritized_memories)
+        # dl = DataLoader(data, batch_size=self.minibatch_size, shuffle=True)
+
+        # for _ in tqdm(range(self.sleep_cycles), desc="🏃 Prioritized Value Epochs"):
+
+        #     # Note: These are batches, not individual samples
+        #     for _, _, latent, _, _, _, rewards, _, _, _, idx in dl:
+        #         v_prediction = self.model.get_real_value(latent)
+        #         v_targ = rewards
+
+        #         # Calculate unclipped value loss
+        #         value_loss = 0.5 * (v_prediction - v_targ.detach()) ** 2
+
+        #         # optimize Lvalue wrt value weights
+        #         self.critic_optim.zero_grad()
+        #         value_loss.mean().backward()
+        #         torch.nn.utils.clip_grad_norm_(self.model.value_parameters(), 5)
+        #         self.critic_optim.step()
 
     def run_train_loop(self):
         """
@@ -568,48 +604,47 @@ class EfficientPhasicPolicyGradient:
         if self.plot:
             self.init_plots()
 
-        for i in range(self.num_rollouts):
 
-            if i % self.save_every == 0:
-                state_dict = self.model.state_dict()
-                th.save(state_dict, f'{self.out_weights_path}_{i}')
+        for _ in range(self.num_phases):
+            # hard reset and save every new set of phases
+            should_hard_reset = True
+            state_dict = self.model.state_dict()
+            th.save(state_dict, f'{self.out_weights_path}_{_}')
 
-                data_path = f"out/{self.training_name}.csv"
-                df = pd.DataFrame(
-                    data={
-                        "pi_loss": self.pi_loss_history,
-                        "v_loss": self.v_loss_history,
-                        "entropy": self.entropy_history,
-                        "expl_var": self.expl_var_history
-                    })
-                df.to_csv(data_path, index=False)
+            data_path = f"out/{self.training_name}.csv"
+            df = pd.DataFrame(
+                data={
+                    "pi_loss": self.pi_loss_history,
+                    "v_loss": self.v_loss_history,
+                    "entropy": self.entropy_history,
+                    "expl_var": self.expl_var_history
+                })
+            df.to_csv(data_path, index=False)
 
-                fig_path = f"out/{self.training_name}.png"
-                self.main_fig.savefig(fig_path)
-                print(f"💾 Saved checkpoint data")
-                print(f"   - {self.out_weights_path}")
-                print(f"   - {data_path}")
-                print(f"   - {fig_path}")
+            fig_path = f"out/{self.training_name}.png"
+            self.main_fig.savefig(fig_path)
+            print(f"💾 Saved checkpoint data")
+            print(f"   - {self.out_weights_path}")
+            print(f"   - {data_path}")
+            print(f"   - {fig_path}")
+            
+            for i in range(self.N_pi):
+                print(
+                    f"🎬 Starting {self.env_name} rollout {i + 1}/{self.N_pi}")
 
-            print(
-                f"🎬 Starting {self.env_name} rollout {i + 1}/{self.num_rollouts}")
+                mems = []
+                for _ in range(self.num_envs):
+                    mems.extend(self.rollout(hard_reset=should_hard_reset))
+                    should_hard_reset = True
 
-            # Do a server restart every 10 rollouts
-            # Note: This is not one-to-one with the episodes
-            # At T = 100, this is every 5 episodes
-            should_hard_reset = i % 10 == 0 and i != 0
-
-            for _ in range(self.num_envs):
-                self.rollout(hard_reset=should_hard_reset)
-
-            # GAE is done in here, and memories=aux_memories
-            self.learn_ppo_phase()
+                # GAE is done in here, and memories=aux_memories
+                self.learn_ppo_phase(mems)
 
             # calculate policy priors
             with torch.no_grad():
-                policy_priors = self.calculate_policy_priors()
+                policy_priors = self.calculate_policy_priors(self.memories)
 
-            self.auxiliary_phase(policy_priors)
+            self.auxiliary_phase(self.memories, policy_priors)
 
             self.memories.clear()
 
@@ -620,11 +655,12 @@ if __name__ == "__main__":
         env_name="MineRLPunchCowEz-v0",
         model="foundation-model-1x",
         weights="foundation-model-1x",
-        out_weights="cow-deleter-ppg-eff-1x",
+        out_weights=f"cow-deleter-ppg-eff-yes-norm-kl-5clipping-old-value-1x{time.time()}",
         save_every=5,
         num_envs=5,
-        num_rollouts=500,
-        epochs=5,
+        num_rollouts=3,
+        num_phases=100,
+        epochs=1,
         minibatch_size=48,
         lr=2.5e-5,
         weight_decay=0,
