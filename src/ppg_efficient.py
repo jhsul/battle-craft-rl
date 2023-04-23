@@ -29,6 +29,8 @@ device = th.device("cuda:0" if th.cuda.is_available() else "cpu")
 # device = th.device("mps")  # apple silicon
 
 TRAIN_WHOLE_MODEL = False
+P_CLIP=1
+CLIP=5
 
 
 
@@ -57,6 +59,7 @@ class EfficientPhasicPolicyGradient:
             lam: float,
             beta_klp: float,
             num_phases,
+            beta_klp_decay,
 
 
             mem_buffer_size: int,
@@ -100,6 +103,7 @@ class EfficientPhasicPolicyGradient:
         self.beta_clone = beta_clone
         self.num_phases = num_phases
         self.saved_rewards = [-199]
+        self.kl_decay = beta_klp_decay
 
         self.plot = plot
 
@@ -131,7 +135,6 @@ class EfficientPhasicPolicyGradient:
 
 
         # Make our agents
-
         self.model = EfficientVPT(self.env, policy_kwargs=policy_kwargs,
                                  pi_head_kwargs=pi_head_kwargs, use_skip=True)
         self.model.load_weights(weights_path)
@@ -151,6 +154,7 @@ class EfficientPhasicPolicyGradient:
         # This will be a relatively large chunk of data
         # Potential memory issues / optimizations around here...
         self.memories: List[Memory] = []
+        self.replay_buffer: List[Memory] = []
         # self.prioritized_memories = []
         # self.best_reward_so_far = -199
 
@@ -263,9 +267,11 @@ class EfficientPhasicPolicyGradient:
         if hard_reset:
             self.env.close()
             self.env = gym.make(self.env_name)
-            next_obs = self.env.reset()
+            next_obs, next_env = safe_reset(self.env)
+            self.env = next_env
         else:
-            next_obs = self.env.reset()
+            next_obs, next_env = safe_reset(self.env)
+            self.env = next_env
 
         done = False
 
@@ -420,7 +426,6 @@ class EfficientPhasicPolicyGradient:
                 v_prediction = self.model.get_real_value(latent)
                 pi_distribution = self.model.get_policy(latent)
                 orig_pi_dists = self.orig_agent.policy.pi_head(latent)
-                v_orig = self.orig_agent.policy.value_head(latent)
 
 
                 action_log_probs = self.model.policy.get_logprob_of_action(
@@ -446,18 +451,18 @@ class EfficientPhasicPolicyGradient:
                 policy_loss = - th.min(surr1, surr2) - self.beta_s * entropy + self.beta_klp * kl_term
 
                 # Calculate unclipped value loss with a penalty term for deviating from the original
-                value_loss = 0.5 * ((v_prediction.squeeze() - returns) ** 2 + (v_prediction - v_orig)**2)
+                value_loss = 0.5 * ((v_prediction.squeeze() - returns) ** 2) # + (v_prediction - v_orig)**2)
 
                 # Backprop for policy
                 self.policy_optim.zero_grad()
                 policy_loss.mean().backward()
-                torch.nn.utils.clip_grad_norm_(self.model.policy_parameters(), 5)
+                torch.nn.utils.clip_grad_norm_(self.model.policy_parameters(), P_CLIP)
                 self.policy_optim.step()
 
                 # Backprop for critic
                 self.critic_optim.zero_grad()
                 value_loss.mean().backward()
-                torch.nn.utils.clip_grad_norm_(self.model.value_parameters(), 5)
+                torch.nn.utils.clip_grad_norm_(self.model.value_parameters(), CLIP)
                 self.critic_optim.step()
 
                 if self.plot:
@@ -467,6 +472,10 @@ class EfficientPhasicPolicyGradient:
                     self.expl_var_history.append(explained_variance.item())
 
                     self.entropy_history.append(entropy.mean().item())
+                    
+                 # Update learning rate
+                self.scheduler.step()
+                self.scheduler_critic.step()
 
             # Update plot at the end of every epoch
             if self.plot:
@@ -509,10 +518,7 @@ class EfficientPhasicPolicyGradient:
                 self.main_fig.canvas.draw()
                 self.main_fig.canvas.flush_events()
 
-        # Update learning rate
-        # TODO how to handle this in the aux phase?
-        self.scheduler.step()
-        self.scheduler_critic.step()
+
 
     def calculate_policy_priors(self, memories):
         '''
@@ -551,7 +557,6 @@ class EfficientPhasicPolicyGradient:
                 v_prediction = self.model.get_real_value(latent)
                 pi_dists = self.model.get_policy(latent)
                 aux_prediction = self.model.get_aux_value(latent)
-                v_orig = self.orig_agent.policy.value_head(latent)
 
                 # The returns are stored in the `reward` field in memory, for some reason
                 v_targ = rewards
@@ -563,25 +568,25 @@ class EfficientPhasicPolicyGradient:
                 joint_loss = aux_loss + self.beta_clone * kl_term
 
                 # Calculate unclipped value loss
-                value_loss = 0.5 * ((v_prediction - v_targ.detach()) ** 2 + (v_prediction - v_orig)**2)
+                value_loss = 0.5 * ((v_prediction - v_targ.detach()) ** 2 ) # + (v_prediction - v_orig)**2)
 
                 # optimize Ljoint wrt policy weights
                 self.policy_optim.zero_grad()
                 joint_loss.mean().backward()
-                torch.nn.utils.clip_grad_norm_(self.model.policy_parameters(), 5)
+                torch.nn.utils.clip_grad_norm_(self.model.policy_parameters(), P_CLIP)
                 self.policy_optim.step()
 
                 # optimize Lvalue wrt value weights
                 self.critic_optim.zero_grad()
                 value_loss.mean().backward()
-                torch.nn.utils.clip_grad_norm_(self.model.value_parameters(), 5)
+                torch.nn.utils.clip_grad_norm_(self.model.value_parameters(), CLIP)
                 self.critic_optim.step()
 
 
-        # data = IndexedMemoryDataset(self.prioritized_memories)
+        # data = IndexedMemoryDataset(self.replay_buffer)
         # dl = DataLoader(data, batch_size=self.minibatch_size, shuffle=True)
 
-        # for _ in tqdm(range(self.sleep_cycles), desc="🏃 Prioritized Value Epochs"):
+        # for _ in tqdm(range(self.sleep_cycles), desc="🏃 Replay Buffer Value Epochs"):
 
         #     # Note: These are batches, not individual samples
         #     for _, _, latent, _, _, _, rewards, _, _, _, idx in dl:
@@ -644,7 +649,12 @@ class EfficientPhasicPolicyGradient:
             with torch.no_grad():
                 policy_priors = self.calculate_policy_priors(self.memories)
 
+            # self.replay_buffer.extend(self.memories)
+            # if len(self.replay_buffer) > self.mem_buffer_size:
+            #     self.replay_buffer = self.replay_buffer[len(self.replay_buffer) - self.mem_buffer_size:]
+
             self.auxiliary_phase(self.memories, policy_priors)
+            self.beta_klp = self.beta_klp * self.kl_decay
 
             self.memories.clear()
 
@@ -654,25 +664,26 @@ if __name__ == "__main__":
     ppg = EfficientPhasicPolicyGradient(
         env_name="MineRLPunchCowEz-v0",
         model="foundation-model-1x",
-        weights="cow-deleter-ppg-eff-yes-norm-kl-5clipping-old-value-1x-PUNCH-DOWN",
-        out_weights=f"cow-deleter-ppg-eff-yes-norm-kl-5clipping-old-value-1x{time.time()}",
+        weights="foundation-model-1x",
+        out_weights=f"cow-deleter-ppg-eff-yes-norm-kl-5clipping-1x-small-lr-policy-clip-1{time.time()}",
         save_every=5,
         num_envs=5,
         num_rollouts=3,
         num_phases=100,
         epochs=1,
-        minibatch_size=48,
-        lr=2.5e-6,
-        weight_decay=0,
+        minibatch_size=200,
+        lr=2e-6,
+        weight_decay=0.04,
         betas=(0.9, 0.999),
-        beta_s=0, # no entropy in fine tuning!
-        eps_clip=0.2,
+        beta_s=0.5, 
+        eps_clip=0.1,
         value_clip=0.2,
         value_loss_weight=0.2,
-        gamma=0.99,
+        gamma=0.999,
         lam=0.95,
         beta_klp = 1,
-        sleep_cycles=5,
+        beta_klp_decay=0.9995,
+        sleep_cycles=2,
         beta_clone=1,
         mem_buffer_size=100000,
         plot=True,
