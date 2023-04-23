@@ -136,8 +136,8 @@ class EfficientPhasicPolicyGradient:
 
         # Make our agents
         self.model = EfficientVPT(self.env, policy_kwargs=policy_kwargs,
-                                 pi_head_kwargs=pi_head_kwargs, use_skip=True)
-        self.model.load_weights(weights_path)
+                                 pi_head_kwargs=pi_head_kwargs, use_skip=True, standard=True)
+        self.model.load_vpt_weights(weights_path)
 
         self.policy_optim = th.optim.Adam(self.model.policy_parameters(), lr=lr, betas=betas, weight_decay=weight_decay)
         
@@ -665,12 +665,12 @@ if __name__ == "__main__":
         env_name="MineRLPunchCowEz-v0",
         model="foundation-model-1x",
         weights="foundation-model-1x",
-        out_weights=f"cow-deleter-ppg-eff-yes-norm-kl-5clipping-1x-small-lr-policy-clip-1{time.time()}",
+        out_weights=f"cow-deleter-PPO-eff-yes-norm-kl-5clipping-1x-small-lr-policy-clip-1{time.time()}",
         save_every=5,
         num_envs=5,
         num_rollouts=3,
         num_phases=100,
-        epochs=1,
+        epochs=6,
         minibatch_size=200,
         lr=2e-6,
         weight_decay=0.04,
@@ -683,7 +683,7 @@ if __name__ == "__main__":
         lam=0.95,
         beta_klp = 1,
         beta_klp_decay=0.9995,
-        sleep_cycles=2,
+        sleep_cycles=0, # 0 for ppo, > 0 for ppg
         beta_clone=1,
         mem_buffer_size=100000,
         plot=True,

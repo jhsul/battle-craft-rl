@@ -35,11 +35,12 @@ class ConnectionNetwork(nn.Module):
 
 class EfficientVPT(nn.Module):
 
-    def __init__(self, env, device=None, policy_kwargs=None, pi_head_kwargs=None, use_skip=None):
+    def __init__(self, env, device=None, policy_kwargs=None, pi_head_kwargs=None, use_skip=None, standard=False):
         super(EfficientVPT, self).__init__()
         if device is None:
             device = 'cpu'
         self.device = th.device(device)
+        self.standard = standard
         # Set the default torch device for underlying code as well
         set_default_torch_device(self.device)
         self.action_mapper = CameraHierarchicalMapping(n_camera_bins=11)
@@ -75,13 +76,23 @@ class EfficientVPT(nn.Module):
         return latent, hidden_state_out
 
     def get_real_value(self, latent, normalize=True):
+        if self.standard:
+            return self.get_real_value_standard(latent, normalize)
+        return self.get_real_value_connected(latent, normalize)
+    
+    def get_policy(self, latent):
+        if self.standard:
+            return self.get_policy_standard(latent)
+        return self.get_policy_connected(latent)
+    
+    def get_real_value_connected(self, latent, normalize=True):
         latent = self.value_processor(latent)
         v = self.value_head(latent)
         if not normalize:
             return v
         return self.value_head.normalize(v)
     
-    def get_policy(self, latent):
+    def get_policy_connected(self, latent):
         latent = self.connection_net(latent)
         return self.policy.pi_head(latent)
     
@@ -91,6 +102,15 @@ class EfficientVPT(nn.Module):
         if not normalize:
             return av
         return self.policy.value_head.normalize(av)
+    
+    def get_real_value_standard(self, latent, normalize=True):
+        v = self.value_head(latent)
+        if not normalize:
+            return v
+        return self.value_head.normalize(v)
+    
+    def get_policy_standard(self, latent):
+        return self.policy.pi_head(latent)
     
     def value_parameters(self):
         return list(self.value_head.parameters()) + list(self.value_processor.parameters())
