@@ -32,7 +32,7 @@ def main(
 ):
     env_name = env
     model_path = f"models/{model}.model"
-    weights_path = f"weights/{weights}.weights"
+    weights_path = f"noted_weights/{weights}.weights"
 
     baseline_name = f"{env_name}&{model}&{weights}"
 
@@ -79,7 +79,7 @@ def main(
             action = agent.get_action(obs)
             obs, reward, done, info = env.step(action)
             total_reward += reward
-            # env.render()
+            env.render()
 
         rewards.append(total_reward)
         killed.append(obs["mob_kills"]["mob_kills"] > 1)

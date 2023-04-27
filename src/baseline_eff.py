@@ -95,7 +95,7 @@ def main(
             
             obs, reward, done, info = env.step(action)
             total_reward += reward
-            # env.render()
+            env.render()
 
         rewards.append(total_reward)
         killed.append(obs["mob_kills"]["mob_kills"] > 1)

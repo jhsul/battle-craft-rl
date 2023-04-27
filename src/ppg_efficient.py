@@ -30,7 +30,7 @@ device = th.device("cuda:0" if th.cuda.is_available() else "cpu")
 
 TRAIN_WHOLE_MODEL = False
 P_CLIP=1
-CLIP=5
+CLIP=1
 
 
 
@@ -136,7 +136,7 @@ class EfficientPhasicPolicyGradient:
 
         # Make our agents
         self.model = EfficientVPT(self.env, policy_kwargs=policy_kwargs,
-                                 pi_head_kwargs=pi_head_kwargs, use_skip=True, standard=True)
+                                 pi_head_kwargs=pi_head_kwargs, use_skip=True, standard=False)
         self.model.load_vpt_weights(weights_path)
 
         self.policy_optim = th.optim.Adam(self.model.policy_parameters(), lr=lr, betas=betas, weight_decay=weight_decay)
@@ -176,12 +176,12 @@ class EfficientPhasicPolicyGradient:
         latent, hidden_state_out = self.model.run_vpt_base(agent_obs, hidden_state, dummy_first)
 
         pi_dist = self.model.get_policy(latent)
-        v_pred = self.model.get_real_value(latent)
+        v_pred = self.model.get_real_value(latent, normalize=True)
         
         if not use_aux:
             return pi_dist, v_pred, hidden_state_out, latent
         
-        aux = self.model.get_aux_value(latent)
+        aux = self.model.get_aux_value(latent, normalize=True)
 
         return pi_dist, v_pred, aux, hidden_state_out, latent
 
@@ -321,7 +321,7 @@ class EfficientPhasicPolicyGradient:
             # Important! When we store a memory, we want the hidden state at the time of the observation as input! Not the step after
             # This is because we need to fully recreate the input when training the LSTM part of the network
             memory = Memory(0, 0, latent, 0, action, action_log_prob,
-                            reward, 0, done, v_prediction)
+                            reward, 0, done, v_prediction.item())
 
             rollout_memories.append(memory)
 
@@ -334,12 +334,12 @@ class EfficientPhasicPolicyGradient:
                     # Calculate the GAE up to this point
                     # TODO I imagine this makes this quite slow...
                     v_preds = np.array(list(map(lambda mem: mem.advantage, rollout_memories)))
-                    rewards = normalize(np.array(list(map(lambda mem: mem.returns, rollout_memories))))
+                    rewards = np.array(list(map(lambda mem: mem.returns, rollout_memories)))
                     masks = list(
                         map(lambda mem: 1 - float(mem.done), rollout_memories))
 
                     returns, advantages = returns_and_advantages(
-                        rewards, v_preds, masks, self.gamma, self.lam)
+                        normalize(rewards), v_preds, masks, self.gamma, self.lam)
 
                     # Update data
                     self.live_reward_history.append(reward)
@@ -448,19 +448,24 @@ class EfficientPhasicPolicyGradient:
                 surr2 = ratios.clamp(
                     1 - self.eps_clip, 1 + self.eps_clip) * advantages
                 kl_term = self.model.policy.pi_head.kl_divergence(orig_pi_dists, pi_distribution)
-                policy_loss = - th.min(surr1, surr2) - self.beta_s * entropy + self.beta_klp * kl_term
+                policy_loss = - th.min(surr1, surr2) - self.beta_s * entropy - self.beta_klp * kl_term
 
                 # Calculate unclipped value loss with a penalty term for deviating from the original
-                value_loss = 0.5 * ((v_prediction.squeeze() - returns) ** 2) # + (v_prediction - v_orig)**2)
+                value_loss = ((v_prediction.squeeze() - returns) ** 2) # + (v_prediction - v_orig)**2)
+
+                # loss = policy_loss.mean() + 0.2 * value_loss.mean()
 
                 # Backprop for policy
                 self.policy_optim.zero_grad()
+                self.critic_optim.zero_grad()
+
+
                 policy_loss.mean().backward()
                 torch.nn.utils.clip_grad_norm_(self.model.policy_parameters(), P_CLIP)
                 self.policy_optim.step()
 
                 # Backprop for critic
-                self.critic_optim.zero_grad()
+
                 value_loss.mean().backward()
                 torch.nn.utils.clip_grad_norm_(self.model.value_parameters(), CLIP)
                 self.critic_optim.step()
@@ -665,25 +670,25 @@ if __name__ == "__main__":
         env_name="MineRLPunchCowEz-v0",
         model="foundation-model-1x",
         weights="foundation-model-1x",
-        out_weights=f"cow-deleter-PPO-eff-yes-norm-kl-5clipping-1x-small-lr-policy-clip-1{time.time()}",
+        out_weights=f"COW-DELETER-EZ-PPG-eff-kl-1clipping-1x-gaenorm-GO-more-damage-norm-SMALLR{time.time()}",
         save_every=5,
-        num_envs=5,
-        num_rollouts=3,
-        num_phases=100,
-        epochs=6,
-        minibatch_size=200,
-        lr=2e-6,
-        weight_decay=0.04,
+        num_envs=4,
+        num_rollouts=1,
+        num_phases=50,
+        epochs=1,
+        minibatch_size=50,
+        lr=2.5e-8,
+        weight_decay=0.01,
         betas=(0.9, 0.999),
-        beta_s=0.5, 
-        eps_clip=0.1,
+        beta_s=0.2, 
+        eps_clip=0.2,
         value_clip=0.2,
         value_loss_weight=0.2,
-        gamma=0.999,
+        gamma=0.99,
         lam=0.95,
-        beta_klp = 1,
-        beta_klp_decay=0.9995,
-        sleep_cycles=0, # 0 for ppo, > 0 for ppg
+        beta_klp = 0.2,
+        beta_klp_decay=1,
+        sleep_cycles=2, # 0 for ppo, > 0 for ppg
         beta_clone=1,
         mem_buffer_size=100000,
         plot=True,
