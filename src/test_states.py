@@ -187,19 +187,23 @@ class Testor:
 
             # Need to run this with no_grad or else the gradient descent will crash during training lol
             
+
+            x = []
+            y0 = []
+            y1 = []
             with th.no_grad():
                 (pi_h, v_h), state = self.agent.policy.net(
                     agent_obs, state, context={"first": dummy_first})
 
                 # print(state.shape)
                 # print("p and v")
-                print(pi_h.shape)
-                print(v_h.shape)
+                # print(pi_h.shape)
+                # print(v_h.shape)
 
                 # print("state")
                 # print(state[0][0].shape)
                 print(state[0][1][0].shape)
-                # print(state[0][1][1].shape)
+                print(state[0][1][1].shape)
 
                 # # print(state[1][0].shape)
                 # # print(len(state)) # there are 4 parts of state overall
@@ -216,6 +220,26 @@ class Testor:
                 # print(state[3][1][0].shape)
                 # print(state[3][1][1].shape)
 
+                x.append(counter)
+                # using the 127th index because that is where the newest data at each iteration is stored
+                y0.append(state[0][1][0][0][127].detach().cpu().numpy())
+                y1.append(state[0][1][1][0][127].detach().cpu().numpy())
+                
+                
+                # plot the graph for y0
+                plt.subplot(2, 1, 1)
+                plt.plot(x, y0, 'ro')
+                plt.xlabel('X = frame')
+                plt.ylabel('Y0 = new update ')
+
+                # plot the graph for y1
+                plt.subplot(2, 1, 2)
+                plt.plot(x, y1, 'bo')
+                plt.xlabel('X = frame')
+                plt.ylabel('Y1 = new update ')
+
+                plt.show(block=False)
+                plt.pause(0.001)
 
                 #TODO Caleb: Next we will put heads and state in folder based on Net iteration
                 folder_path = f"/home/calebtalley/battle-craft-rl/caleb_states/Net_{num_states}" # the file
@@ -304,6 +328,7 @@ if __name__ == "__main__":
     rc = RewardsCalculator(
     damage_dealt=1
     )
+    # input what weights and model you want to use
     model_weights_num = input("what model and weights do you want?: ")
     print(f"Using models/foundation-model-{model_weights_num}x.model")
     print(f"Using models/foundation-model-{model_weights_num}x.weights")
